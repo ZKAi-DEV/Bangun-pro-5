@@ -3,6 +3,7 @@ package com.ubay.bangunproduktif
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.AlarmManager
+import android.app.Dialog
 import android.app.DownloadManager
 import android.app.PendingIntent
 import android.content.Context
@@ -13,7 +14,9 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.Message
 import android.speech.tts.TextToSpeech
+import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
@@ -51,7 +54,7 @@ data class NativeAlarm(
     val time: String,
     val reps: Int,
     val label: String,
-    val days: List<Int>,
+    val days: List<Int>, // 0=Min .. 6=Sab
     val enabled: Boolean
 )
 
@@ -101,30 +104,6 @@ class NativeWebBridge(
     }
 
     @JavascriptInterface
-    fun syncFinanceSummary(financeJson: String) {
-        try {
-            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putString("finance_summary_json", financeJson).apply()
-        } catch (_: Exception) {}
-    }
-
-    @JavascriptInterface
-    fun syncAiConfig(configJson: String) {
-        try {
-            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
-            prefs.edit().putString("ai_config_json", configJson).apply()
-            val obj = JSONObject(configJson)
-            if (obj.has("aiCoachEnabled")) {
-                prefs.edit().putBoolean("ai_coach_enabled", obj.optBoolean("aiCoachEnabled", true)).apply()
-            }
-            if (obj.has("aiVoiceEnabled")) {
-                prefs.edit().putBoolean("ai_voice_enabled", obj.optBoolean("aiVoiceEnabled", true)).apply()
-            }
-            AiCoachReceiver.scheduleAllDailyAiCoachSlots(context)
-        } catch (_: Exception) {}
-    }
-
-    @JavascriptInterface
     fun setAiCoachEnabled(enabled: Boolean) {
         try {
             val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
@@ -140,7 +119,9 @@ class NativeWebBridge(
         try {
             val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
             prefs.edit().putBoolean("ai_voice_enabled", enabled).apply()
-            if (!enabled) stopSpeaking()
+            if (!enabled) {
+                stopSpeaking()
+            }
         } catch (_: Exception) {}
     }
 
@@ -164,10 +145,11 @@ class NativeWebBridge(
     }
 
     @JavascriptInterface
-    fun triggerBackgroundAiNow(slotName: String) {
+    fun testBackgroundVoiceNow(title: String, body: String) {
         try {
             val voiceIntent = Intent(context, AiVoiceService::class.java).apply {
-                putExtra(AiVoiceService.EXTRA_AI_SLOT, slotName.ifBlank { "Live" })
+                putExtra(AiVoiceService.EXTRA_VOICE_TITLE, title.ifBlank { "AI BangunProduktif" })
+                putExtra(AiVoiceService.EXTRA_VOICE_TEXT, body.ifBlank { "Halo! Suara AI latar belakang sudah aktif." })
             }
             ContextCompat.startForegroundService(context, voiceIntent)
         } catch (_: Exception) {}
@@ -252,7 +234,6 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     private var pendingChallenge by mutableStateOf(false)
     private var pendingLabel by mutableStateOf("Waktunya Bangun & Push-Up!")
     private var pendingReps by mutableIntStateOf(10)
-    private var pendingOpenAiTab by mutableStateOf(false)
 
     private var tts: TextToSpeech? = null
     private var isTtsReady = false
@@ -274,7 +255,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
 
         tts = TextToSpeech(applicationContext, this)
 
-        handleLaunchIntent(intent)
+        handleAlarmIntent(intent)
         AiCoachReceiver.scheduleAllDailyAiCoachSlots(this)
 
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
@@ -289,13 +270,11 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         })
 
         setContent {
-            BangunProduktifProApp(
+            BangunProduktifIdenticalApp(
                 pendingChallenge = pendingChallenge,
                 pendingLabel = pendingLabel,
                 pendingReps = pendingReps,
-                pendingOpenAiTab = pendingOpenAiTab,
                 onChallengeDispatched = { pendingChallenge = false },
-                onAiTabDispatched = { pendingOpenAiTab = false },
                 onWebViewReady = { webViewRef = it },
                 onSpeakImmediate = { text -> speakImmediateIndonesian(text) },
                 onStopImmediate = { stopImmediateSpeech() }
@@ -310,8 +289,8 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
                 engine.setLanguage(Locale.getDefault())
             }
-            engine.setSpeechRate(1.02f)
-            engine.setPitch(1.0f)
+            engine.setSpeechRate(1.0f)
+            engine.setPitch(1.02f)
             engine.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -323,15 +302,14 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     }
 
     private fun speakImmediateIndonesian(text: String) {
-        val cleanText = text.replace("*", "").replace("#", "").replace("`", "")
         runOnUiThread {
             if (isTtsReady && tts != null) {
-                tts?.speak(cleanText, TextToSpeech.QUEUE_FLUSH, null, "bp_fg_${System.currentTimeMillis()}")
+                tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "bp_fg_${System.currentTimeMillis()}")
             } else {
                 try {
                     val voiceIntent = Intent(this, AiVoiceService::class.java).apply {
                         putExtra(AiVoiceService.EXTRA_VOICE_TITLE, "AI BangunProduktif")
-                        putExtra(AiVoiceService.EXTRA_VOICE_TEXT, cleanText)
+                        putExtra(AiVoiceService.EXTRA_VOICE_TEXT, text)
                     }
                     ContextCompat.startForegroundService(this, voiceIntent)
                 } catch (_: Exception) {}
@@ -350,7 +328,7 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
-        handleLaunchIntent(intent)
+        handleAlarmIntent(intent)
         AiCoachReceiver.scheduleAllDailyAiCoachSlots(this)
     }
 
@@ -362,29 +340,23 @@ class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
         super.onDestroy()
     }
 
-    private fun handleLaunchIntent(intent: Intent?) {
+    private fun handleAlarmIntent(intent: Intent?) {
         val trigger = intent?.getBooleanExtra("TRIGGER_CHALLENGE", false) ?: false
         if (trigger) {
             pendingLabel = intent?.getStringExtra("EXTRA_ALARM_LABEL") ?: "Waktunya Bangun & Push-Up!"
             pendingReps = intent?.getIntExtra("EXTRA_ALARM_REPS", 10) ?: 10
             pendingChallenge = true
         }
-        val openAi = intent?.getBooleanExtra("OPEN_AI_TAB", false) ?: false
-        if (openAi) {
-            pendingOpenAiTab = true
-        }
     }
 }
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
-fun BangunProduktifProApp(
+fun BangunProduktifIdenticalApp(
     pendingChallenge: Boolean,
     pendingLabel: String,
     pendingReps: Int,
-    pendingOpenAiTab: Boolean,
     onChallengeDispatched: () -> Unit,
-    onAiTabDispatched: () -> Unit,
     onWebViewReady: (WebView) -> Unit,
     onSpeakImmediate: (String) -> Unit,
     onStopImmediate: () -> Unit
@@ -399,10 +371,7 @@ fun BangunProduktifProApp(
     ) {}
 
     LaunchedEffect(Unit) {
-        val needed = mutableListOf(
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO
-        )
+        val needed = mutableListOf(Manifest.permission.CAMERA)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             needed.add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -444,22 +413,16 @@ fun BangunProduktifProApp(
         }
     }
 
-    LaunchedEffect(pendingOpenAiTab, pageFinished, webViewInstance) {
-        if (pendingOpenAiTab && pageFinished && webViewInstance != null) {
-            webViewInstance?.evaluateJavascript(
-                "if (typeof switchTab === 'function') { switchTab('ai'); }",
-                null
-            )
-            onAiTabDispatched()
-        }
-    }
-
+    // Gunakan origin https://zkai-dev.github.io agar cocok dengan Google Cloud OAuth Client ID
     val assetLoader = remember {
         WebViewAssetLoader.Builder()
-            .setDomain("appassets.androidplatform.net")
-            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
+            .setDomain("zkai-dev.github.io")
+            .addPathHandler("/Bangun-produktif/", WebViewAssetLoader.AssetsPathHandler(context))
             .build()
     }
+
+    val cleanChromeUserAgent =
+        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.6478.122 Mobile Safari/537.36"
 
     AndroidView(
         modifier = Modifier
@@ -479,10 +442,10 @@ fun BangunProduktifProApp(
                     allowContentAccess = true
                     mediaPlaybackRequiresUserGesture = false
                     javaScriptCanOpenWindowsAutomatically = true
-                    setSupportMultipleWindows(false)
+                    setSupportMultipleWindows(true)
                     mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
                     cacheMode = WebSettings.LOAD_DEFAULT
-                    userAgentString = userAgentString.replace("; wv", "")
+                    userAgentString = cleanChromeUserAgent
                 }
 
                 addJavascriptInterface(
@@ -495,7 +458,15 @@ fun BangunProduktifProApp(
                         view: WebView?,
                         request: WebResourceRequest
                     ): WebResourceResponse? {
-                        return assetLoader.shouldInterceptRequest(request.url)
+                        val url = request.url
+                        if (url.host == "zkai-dev.github.io" &&
+                            (url.path == "/Bangun-produktif" || url.path == "/Bangun-produktif/")
+                        ) {
+                            return assetLoader.shouldInterceptRequest(
+                                Uri.parse("https://zkai-dev.github.io/Bangun-produktif/index.html")
+                            )
+                        }
+                        return assetLoader.shouldInterceptRequest(url)
                     }
 
                     override fun onPageFinished(view: WebView?, url: String?) {
@@ -509,51 +480,32 @@ fun BangunProduktifProApp(
                         request?.grant(request.resources)
                     }
 
-                    override fun onShowFileChooser(
-                        webView: WebView?,
-                        callback: ValueCallback<Array<Uri>>?,
-                        fileChooserParams: FileChooserParams?
+                    // Tangani jendela popup Google OAuth dengan Dialog WebView terpisah
+                    override fun onCreateWindow(
+                        view: WebView?,
+                        isDialog: Boolean,
+                        isUserGesture: Boolean,
+                        resultMsg: Message?
                     ): Boolean {
-                        filePathCallback?.onReceiveValue(null)
-                        filePathCallback = callback
-                        return try {
-                            val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
-                                addCategory(Intent.CATEGORY_OPENABLE)
-                                type = "*/*"
+                        val popupDialog = Dialog(ctx, android.R.style.Theme_DeviceDefault_NoActionBar)
+                        val popupWebView = WebView(ctx).apply {
+                            CookieManager.getInstance().setAcceptCookie(true)
+                            CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+                            settings.apply {
+                                javaScriptEnabled = true
+                                domStorageEnabled = true
+                                databaseEnabled = true
+                                javaScriptCanOpenWindowsAutomatically = true
+                                setSupportMultipleWindows(true)
+                                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                                userAgentString = cleanChromeUserAgent
                             }
-                            fileChooserLauncher.launch(intent)
-                            true
-                        } catch (_: Exception) {
-                            filePathCallback = null
-                            false
-                        }
-                    }
-                }
-
-                setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
-                    try {
-                        if (url.startsWith("http://") || url.startsWith("https://")) {
-                            val req = DownloadManager.Request(Uri.parse(url)).apply {
-                                setMimeType(mimeType)
-                                addRequestHeader("User-Agent", userAgent)
-                                setTitle(URLUtil.guessFileName(url, contentDisposition, mimeType))
-                                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                                setDestinationInExternalPublicDir(
-                                    Environment.DIRECTORY_DOWNLOADS,
-                                    URLUtil.guessFileName(url, contentDisposition, mimeType)
-                                )
+                            webViewClient = object : WebViewClient() {
+                                override fun shouldInterceptRequest(
+                                    v: WebView?,
+                                    req: WebResourceRequest
+                                ): WebResourceResponse? {
+                                    return assetLoader.shouldInterceptRequest(req.url)
+                                }
                             }
-                            val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                            dm.enqueue(req)
-                            Toast.makeText(ctx, "Mengunduh file...", Toast.LENGTH_SHORT).show()
-                        }
-                    } catch (_: Exception) {}
-                }
-
-                loadUrl("https://appassets.androidplatform.net/assets/index.html")
-                webViewInstance = this
-                onWebViewReady(this)
-            }
-        }
-    )
-}
+               
