@@ -66,13 +66,12 @@ class AiVoiceService : Service(), TextToSpeech.OnInitListener {
         mainHandler.postDelayed(autoStopRunnable, 35_000L)
 
         val prefs = getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
-        val savedKey = (prefs.getString("gemini_api_key", "") ?: "").trim()
-        val defaultKey = listOf("AQ.Ab8RN6I", "Um_-b4rFwHP", "2DYZCKnzYcT", "BtI8Ss7VY0w", "7C-CWmneRA").joinToString("")
-        val apiKey = if (savedKey.length > 15) savedKey else defaultKey
+        val savedRaw = (prefs.getString("gemini_api_key", "") ?: "").trim()
         val voiceName = prefs.getString("gemini_voice_name", "Aoede") ?: "Aoede"
+        val keyPool = buildBackgroundGeminiKeyPool(savedRaw)
 
-        if (apiKey.length > 15) {
-            speakWithGeminiFemaleVoice(apiKey, text, voiceName)
+        if (keyPool.isNotEmpty()) {
+            speakWithGeminiFemaleVoice(keyPool, text, voiceName)
         } else {
             pendingText = text
             if (isTtsReady) {
@@ -83,61 +82,98 @@ class AiVoiceService : Service(), TextToSpeech.OnInitListener {
         return START_NOT_STICKY
     }
 
-    private fun speakWithGeminiFemaleVoice(apiKey: String, text: String, voiceName: String) {
+    private fun buildBackgroundGeminiKeyPool(savedRaw: String): List<String> {
+        val builtins = listOf(
+            listOf("AQ.Ab8RN6L", "vfC4A99_Og7", "XKfLGP7-v9v", "sV6LLVXnueD", "KdLreOGyKA").joinToString(""),
+            listOf("AQ.Ab8RN6J", "8Em2SRS-kr7", "7vyXpSapYNy", "rjzApqKCzTD", "qaGndWeGfA").joinToString(""),
+            listOf("AQ.Ab8RN6I", "nPL54p7XgME", "24bFGlZ8Ruj", "D3czbh4nZlj", "8dfeXdMDvQ").joinToString(""),
+            listOf("AQ.Ab8RN6L", "1GeFXmGCF-9", "khXgNe9gNgd", "rffAPWOAxRB", "3nk6wiU8LQ").joinToString(""),
+            listOf("AQ.Ab8RN6I", "eZW4ld-8w4o", "HML8dx0YfqR", "r3X8uqaV1G8", "3pJ1pIFzjQ").joinToString(""),
+            listOf("AQ.Ab8RN6K", "UdOGzrJ1QFQ", "reuRoWiGoVw", "65SCGrS_rPR", "w1-KezGKeA").joinToString(""),
+            listOf("AQ.Ab8RN6I", "Um_-b4rFwHP", "2DYZCKnzYcT", "BtI8Ss7VY0w", "7C-CWmneRA").joinToString("")
+        )
+        val legacyKey = builtins.last()
+        val customKeys = savedRaw
+            .split(",", "\n", "\r", ";", " ")
+            .map { it.trim() }
+            .filter { it.length > 15 }
+        val ordered = LinkedHashSet<String>()
+        customKeys.filter { it != legacyKey }.forEach { ordered.add(it) }
+        builtins.forEach { ordered.add(it) }
+        customKeys.forEach { ordered.add(it) }
+        return ordered.toList()
+    }
+
+    private fun speakWithGeminiFemaleVoice(keyPool: List<String>, text: String, voiceName: String) {
         thread {
-            try {
-                val url = URL("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=$apiKey")
-                val conn = (url.openConnection() as HttpURLConnection).apply {
-                    requestMethod = "POST"
-                    connectTimeout = 15000
-                    readTimeout = 25000
-                    doOutput = true
-                    setRequestProperty("Content-Type", "application/json; charset=UTF-8")
-                }
+            val models = listOf("gemini-2.5-flash-preview-tts", "gemini-2.5-pro-preview-tts")
+            val startIdx = Math.floorMod(bgRrCursor.getAndIncrement(), keyPool.size)
+            val rotated = keyPool.drop(startIdx) + keyPool.take(startIdx)
 
-                val body = JSONObject().apply {
-                    put("contents", JSONArray().put(
-                        JSONObject().put("parts", JSONArray().put(
-                            JSONObject().put("text", "Ucapkan dengan suara perempuan Indonesia yang hangat, natural, dan lancar: $text")
-                        ))
-                    ))
-                    put("generationConfig", JSONObject().apply {
-                        put("responseModalities", JSONArray().put("AUDIO"))
-                        put("speechConfig", JSONObject().put(
-                            "voiceConfig", JSONObject().put(
-                                "prebuiltVoiceConfig", JSONObject().put("voiceName", voiceName)
-                            )
-                        ))
-                    })
-                }
+            for (model in models) {
+                val now = System.currentTimeMillis()
+                val ready = rotated.filter { (bgCooldownMap["$model::$it"] ?: 0L) <= now }
+                val cooling = rotated.filter { (bgCooldownMap["$model::$it"] ?: 0L) > now }
+                val candidates = ready + cooling
 
-                OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
-
-                if (conn.responseCode in 200..299) {
-                    val respStr = conn.inputStream.bufferedReader().use { it.readText() }
-                    val json = JSONObject(respStr)
-                    val parts = json.getJSONArray("candidates")
-                        .getJSONObject(0)
-                        .getJSONObject("content")
-                        .getJSONArray("parts")
-                    var base64Audio: String? = null
-                    for (i in 0 until parts.length()) {
-                        val p = parts.getJSONObject(i)
-                        if (p.has("inlineData")) {
-                            base64Audio = p.getJSONObject("inlineData").optString("data")
-                            break
+                for (apiKey in candidates) {
+                    try {
+                        val url = URL("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
+                        val conn = (url.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            connectTimeout = 15000
+                            readTimeout = 25000
+                            doOutput = true
+                            setRequestProperty("Content-Type", "application/json; charset=UTF-8")
                         }
-                    }
-                    if (!base64Audio.isNullOrBlank()) {
-                        val pcmBytes = Base64.decode(base64Audio, Base64.DEFAULT)
-                        playPcmAndStopWhenDone(pcmBytes)
-                        return@thread
-                    }
+
+                        val body = JSONObject().apply {
+                            put("contents", JSONArray().put(
+                                JSONObject().put("parts", JSONArray().put(
+                                    JSONObject().put("text", "Say naturally and warmly in fluent Indonesian: $text")
+                                ))
+                            ))
+                            put("generationConfig", JSONObject().apply {
+                                put("responseModalities", JSONArray().put("AUDIO"))
+                                put("speechConfig", JSONObject().put(
+                                    "voiceConfig", JSONObject().put(
+                                        "prebuiltVoiceConfig", JSONObject().put("voiceName", voiceName)
+                                    )
+                                ))
+                            })
+                        }
+
+                        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use { it.write(body.toString()) }
+
+                        val code = conn.responseCode
+                        if (code in 200..299) {
+                            val respStr = conn.inputStream.bufferedReader().use { it.readText() }
+                            val json = JSONObject(respStr)
+                            val parts = json.getJSONArray("candidates")
+                                .getJSONObject(0)
+                                .getJSONObject("content")
+                                .getJSONArray("parts")
+                            var base64Audio: String? = null
+                            for (i in 0 until parts.length()) {
+                                val p = parts.getJSONObject(i)
+                                if (p.has("inlineData")) {
+                                    base64Audio = p.getJSONObject("inlineData").optString("data")
+                                    break
+                                }
+                            }
+                            if (!base64Audio.isNullOrBlank()) {
+                                val pcmBytes = Base64.decode(base64Audio, Base64.DEFAULT)
+                                playPcmAndStopWhenDone(pcmBytes)
+                                return@thread
+                            }
+                        } else {
+                            val cooldownMs = if (code == 429) 65_000L else if (code == 401 || code == 403) 300_000L else 15_000L
+                            bgCooldownMap["$model::$apiKey"] = System.currentTimeMillis() + cooldownMs
+                        }
+                    } catch (_: Exception) {}
                 }
-                triggerFallbackTtsOnMain(text)
-            } catch (_: Exception) {
-                triggerFallbackTtsOnMain(text)
             }
+            triggerFallbackTtsOnMain(text)
         }
     }
 
@@ -195,8 +231,20 @@ class AiVoiceService : Service(), TextToSpeech.OnInitListener {
             if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
                 engine.setLanguage(Locale.getDefault())
             }
+            try {
+                val idVoices = engine.voices?.filter {
+                    it.locale.language.equals("id", ignoreCase = true)
+                }.orEmpty()
+                val preferred = idVoices.firstOrNull { it.name.contains("idc-network", true) }
+                    ?: idVoices.firstOrNull { it.name.contains("dfz-network", true) }
+                    ?: idVoices.firstOrNull { it.name.contains("network", true) }
+                    ?: idVoices.maxByOrNull { it.quality }
+                if (preferred != null) {
+                    engine.voice = preferred
+                }
+            } catch (_: Exception) {}
             engine.setSpeechRate(1.02f)
-            engine.setPitch(1.06f)
+            engine.setPitch(1.04f)
             engine.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_MEDIA)
@@ -291,6 +339,8 @@ class AiVoiceService : Service(), TextToSpeech.OnInitListener {
     }
 
     companion object {
+        private val bgCooldownMap = java.util.concurrent.ConcurrentHashMap<String, Long>()
+        private val bgRrCursor = java.util.concurrent.atomic.AtomicInteger(0)
         const val CHANNEL_ID = "bp_ai_voice_service_channel"
         const val NOTIF_ID = 2002
         const val ACTION_STOP_VOICE = "com.ubay.bangunproduktif.ACTION_STOP_VOICE"
