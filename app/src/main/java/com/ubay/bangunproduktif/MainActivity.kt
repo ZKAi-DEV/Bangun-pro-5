@@ -1,0 +1,559 @@
+package com.ubay.bangunproduktif
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.AlarmManager
+import android.app.DownloadManager
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.AudioAttributes
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.speech.tts.TextToSpeech
+import android.view.WindowManager
+import android.webkit.CookieManager
+import android.webkit.JavascriptInterface
+import android.webkit.PermissionRequest
+import android.webkit.URLUtil
+import android.webkit.ValueCallback
+import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
+import android.webkit.WebSettings
+import android.webkit.WebView
+import android.webkit.WebViewClient
+import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.OnBackPressedCallback
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.ContextCompat
+import androidx.webkit.WebViewAssetLoader
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.Calendar
+import java.util.Locale
+
+data class NativeAlarm(
+    val id: String,
+    val time: String,
+    val reps: Int,
+    val label: String,
+    val days: List<Int>,
+    val enabled: Boolean
+)
+
+class NativeWebBridge(
+    private val context: Context,
+    private val onSpeakImmediate: (String) -> Unit,
+    private val onStopImmediate: () -> Unit
+) {
+    @JavascriptInterface
+    fun syncAlarms(alarmsJson: String) {
+        try {
+            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
+            val oldRaw = prefs.getString("alarms_json", null)
+            if (oldRaw != null) {
+                cancelAllAlarmsFromJson(context, oldRaw)
+            }
+            prefs.edit().putString("alarms_json", alarmsJson).apply()
+
+            val arr = JSONArray(alarmsJson)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                val enabled = o.optBoolean("enabled", true)
+                val dArr = o.optJSONArray("days") ?: JSONArray()
+                val days = (0 until dArr.length()).map { dArr.getInt(it) }
+                val item = NativeAlarm(
+                    id = o.optString("id", "alm_$i"),
+                    time = o.optString("time", "05:00"),
+                    reps = o.optInt("reps", 10),
+                    label = o.optString("label", "Bangun & Push-Up"),
+                    days = days,
+                    enabled = enabled
+                )
+                if (enabled) {
+                    scheduleExactNativeAlarm(context, item)
+                }
+            }
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun syncTodosToAndroidNative(todosJson: String) {
+        try {
+            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putString("todos_json", todosJson).apply()
+            AiCoachReceiver.scheduleAllDailyAiCoachSlots(context)
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun syncFinanceSummary(financeJson: String) {
+        try {
+            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putString("finance_summary_json", financeJson).apply()
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun syncAiConfig(configJson: String) {
+        try {
+            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putString("ai_config_json", configJson).apply()
+            val obj = JSONObject(configJson)
+            if (obj.has("aiCoachEnabled")) {
+                prefs.edit().putBoolean("ai_coach_enabled", obj.optBoolean("aiCoachEnabled", true)).apply()
+            }
+            if (obj.has("aiVoiceEnabled")) {
+                prefs.edit().putBoolean("ai_voice_enabled", obj.optBoolean("aiVoiceEnabled", true)).apply()
+            }
+            AiCoachReceiver.scheduleAllDailyAiCoachSlots(context)
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun setAiCoachEnabled(enabled: Boolean) {
+        try {
+            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putBoolean("ai_coach_enabled", enabled).apply()
+            if (enabled) {
+                AiCoachReceiver.scheduleAllDailyAiCoachSlots(context)
+            }
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun setAiVoiceEnabled(enabled: Boolean) {
+        try {
+            val prefs = context.getSharedPreferences("bangunproduktif_prefs", Context.MODE_PRIVATE)
+            prefs.edit().putBoolean("ai_voice_enabled", enabled).apply()
+            if (!enabled) stopSpeaking()
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun speakText(text: String) {
+        try {
+            if (text.isBlank()) return
+            onSpeakImmediate(text)
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun stopSpeaking() {
+        try {
+            onStopImmediate()
+            val stopIntent = Intent(context, AiVoiceService::class.java).apply {
+                action = AiVoiceService.ACTION_STOP_VOICE
+            }
+            context.startService(stopIntent)
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun triggerBackgroundAiNow(slotName: String) {
+        try {
+            val voiceIntent = Intent(context, AiVoiceService::class.java).apply {
+                putExtra(AiVoiceService.EXTRA_AI_SLOT, slotName.ifBlank { "Live" })
+            }
+            ContextCompat.startForegroundService(context, voiceIntent)
+        } catch (_: Exception) {}
+    }
+
+    @JavascriptInterface
+    fun stopNativeAlarmService() {
+        try {
+            context.stopService(Intent(context, AlarmSoundService::class.java))
+        } catch (_: Exception) {}
+    }
+
+    private fun cancelAllAlarmsFromJson(context: Context, rawJson: String) {
+        try {
+            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val arr = JSONArray(rawJson)
+            for (i in 0 until arr.length()) {
+                val id = arr.getJSONObject(i).optString("id", "alm_$i")
+                val intent = Intent(context, AlarmReceiver::class.java)
+                val pi = PendingIntent.getBroadcast(
+                    context,
+                    id.hashCode(),
+                    intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                am.cancel(pi)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun scheduleExactNativeAlarm(context: Context, alarm: NativeAlarm) {
+        try {
+            val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+            val parts = alarm.time.split(":")
+            val h = parts.getOrNull(0)?.toIntOrNull() ?: 5
+            val m = parts.getOrNull(1)?.toIntOrNull() ?: 0
+
+            val now = Calendar.getInstance()
+            var bestCal: Calendar? = null
+            val activeDays = if (alarm.days.isEmpty()) listOf(0, 1, 2, 3, 4, 5, 6) else alarm.days
+
+            for (offset in 0..7) {
+                val candidate = Calendar.getInstance().apply {
+                    add(Calendar.DAY_OF_YEAR, offset)
+                    set(Calendar.HOUR_OF_DAY, h)
+                    set(Calendar.MINUTE, m)
+                    set(Calendar.SECOND, 0)
+                    set(Calendar.MILLISECOND, 0)
+                }
+                val jsDow = (candidate.get(Calendar.DAY_OF_WEEK) - 1)
+                if (activeDays.contains(jsDow) && candidate.timeInMillis > now.timeInMillis) {
+                    bestCal = candidate
+                    break
+                }
+            }
+
+            val targetTime = bestCal?.timeInMillis ?: return
+
+            val intent = Intent(context, AlarmReceiver::class.java).apply {
+                putExtra("EXTRA_ALARM_ID", alarm.id)
+                putExtra("EXTRA_ALARM_LABEL", alarm.label)
+                putExtra("EXTRA_ALARM_REPS", alarm.reps)
+            }
+            val pi = PendingIntent.getBroadcast(
+                context,
+                alarm.id.hashCode(),
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !am.canScheduleExactAlarms()) {
+                am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, targetTime, pi)
+            } else {
+                am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, targetTime, pi)
+            }
+        } catch (_: Exception) {}
+    }
+}
+
+class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
+    private var webViewRef: WebView? = null
+    private var pendingChallenge by mutableStateOf(false)
+    private var pendingLabel by mutableStateOf("Waktunya Bangun & Push-Up!")
+    private var pendingReps by mutableIntStateOf(10)
+    private var pendingOpenAiTab by mutableStateOf(false)
+
+    private var tts: TextToSpeech? = null
+    private var isTtsReady = false
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        } else {
+            @Suppress("DEPRECATION")
+            window.addFlags(
+                WindowManager.LayoutParams.FLAG_SHOW_WHEN_LOCKED or
+                    WindowManager.LayoutParams.FLAG_TURN_SCREEN_ON or
+                    WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON
+            )
+        }
+
+        tts = TextToSpeech(applicationContext, this)
+
+        handleLaunchIntent(intent)
+        AiCoachReceiver.scheduleAllDailyAiCoachSlots(this)
+
+        onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                val wv = webViewRef
+                if (wv != null && wv.canGoBack()) {
+                    wv.goBack()
+                } else {
+                    finish()
+                }
+            }
+        })
+
+        setContent {
+            BangunProduktifProApp(
+                pendingChallenge = pendingChallenge,
+                pendingLabel = pendingLabel,
+                pendingReps = pendingReps,
+                pendingOpenAiTab = pendingOpenAiTab,
+                onChallengeDispatched = { pendingChallenge = false },
+                onAiTabDispatched = { pendingOpenAiTab = false },
+                onWebViewReady = { webViewRef = it },
+                onSpeakImmediate = { text -> speakImmediateIndonesian(text) },
+                onStopImmediate = { stopImmediateSpeech() }
+            )
+        }
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            val engine = tts ?: return
+            val res = engine.setLanguage(Locale("id", "ID"))
+            if (res == TextToSpeech.LANG_MISSING_DATA || res == TextToSpeech.LANG_NOT_SUPPORTED) {
+                engine.setLanguage(Locale.getDefault())
+            }
+            engine.setSpeechRate(1.02f)
+            engine.setPitch(1.0f)
+            engine.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_MEDIA)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            isTtsReady = true
+        }
+    }
+
+    private fun speakImmediateIndonesian(text: String) {
+        val cleanText = text.replace("*", "").replace("#", "").replace("`", "")
+        runOnUiThread {
+            if (isTtsReady && tts != null) {
+                tts?.speak(cleanText, TextToSpeech.QUEUE_FLUSH, null, "bp_fg_${System.currentTimeMillis()}")
+            } else {
+                try {
+                    val voiceIntent = Intent(this, AiVoiceService::class.java).apply {
+                        putExtra(AiVoiceService.EXTRA_VOICE_TITLE, "AI BangunProduktif")
+                        putExtra(AiVoiceService.EXTRA_VOICE_TEXT, cleanText)
+                    }
+                    ContextCompat.startForegroundService(this, voiceIntent)
+                } catch (_: Exception) {}
+            }
+        }
+    }
+
+    private fun stopImmediateSpeech() {
+        runOnUiThread {
+            try {
+                tts?.stop()
+            } catch (_: Exception) {}
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleLaunchIntent(intent)
+        AiCoachReceiver.scheduleAllDailyAiCoachSlots(this)
+    }
+
+    override fun onDestroy() {
+        try {
+            tts?.stop()
+            tts?.shutdown()
+        } catch (_: Exception) {}
+        super.onDestroy()
+    }
+
+    private fun handleLaunchIntent(intent: Intent?) {
+        val trigger = intent?.getBooleanExtra("TRIGGER_CHALLENGE", false) ?: false
+        if (trigger) {
+            pendingLabel = intent?.getStringExtra("EXTRA_ALARM_LABEL") ?: "Waktunya Bangun & Push-Up!"
+            pendingReps = intent?.getIntExtra("EXTRA_ALARM_REPS", 10) ?: 10
+            pendingChallenge = true
+        }
+        val openAi = intent?.getBooleanExtra("OPEN_AI_TAB", false) ?: false
+        if (openAi) {
+            pendingOpenAiTab = true
+        }
+    }
+}
+
+@SuppressLint("SetJavaScriptEnabled")
+@Composable
+fun BangunProduktifProApp(
+    pendingChallenge: Boolean,
+    pendingLabel: String,
+    pendingReps: Int,
+    pendingOpenAiTab: Boolean,
+    onChallengeDispatched: () -> Unit,
+    onAiTabDispatched: () -> Unit,
+    onWebViewReady: (WebView) -> Unit,
+    onSpeakImmediate: (String) -> Unit,
+    onStopImmediate: () -> Unit
+) {
+    val context = LocalContext.current
+    var filePathCallback by remember { mutableStateOf<ValueCallback<Array<Uri>>?>(null) }
+    var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    var pageFinished by remember { mutableStateOf(false) }
+
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {}
+
+    LaunchedEffect(Unit) {
+        val needed = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.RECORD_AUDIO
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            needed.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        val missing = needed.filter {
+            ContextCompat.checkSelfPermission(context, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (missing.isNotEmpty()) {
+            permissionLauncher.launch(missing.toTypedArray())
+        }
+    }
+
+    val fileChooserLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val data = result.data
+        val uris = mutableListOf<Uri>()
+        if (result.resultCode == android.app.Activity.RESULT_OK && data != null) {
+            val clipData = data.clipData
+            if (clipData != null) {
+                for (i in 0 until clipData.itemCount) {
+                    clipData.getItemAt(i).uri?.let { uris.add(it) }
+                }
+            } else {
+                data.data?.let { uris.add(it) }
+            }
+        }
+        filePathCallback?.onReceiveValue(if (uris.isNotEmpty()) uris.toTypedArray() else null)
+        filePathCallback = null
+    }
+
+    LaunchedEffect(pendingChallenge, pageFinished, webViewInstance) {
+        if (pendingChallenge && pageFinished && webViewInstance != null) {
+            val safeLabel = JSONObject.quote(pendingLabel)
+            webViewInstance?.evaluateJavascript(
+                "if (typeof window.triggerAlarmFromAndroidNative === 'function') { window.triggerAlarmFromAndroidNative($safeLabel, $pendingReps); }",
+                null
+            )
+            onChallengeDispatched()
+        }
+    }
+
+    LaunchedEffect(pendingOpenAiTab, pageFinished, webViewInstance) {
+        if (pendingOpenAiTab && pageFinished && webViewInstance != null) {
+            webViewInstance?.evaluateJavascript(
+                "if (typeof switchTab === 'function') { switchTab('ai'); }",
+                null
+            )
+            onAiTabDispatched()
+        }
+    }
+
+    val assetLoader = remember {
+        WebViewAssetLoader.Builder()
+            .setDomain("appassets.androidplatform.net")
+            .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(context))
+            .build()
+    }
+
+    AndroidView(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color(0xFF08090C)),
+        factory = { ctx ->
+            WebView(ctx).apply {
+                setBackgroundColor(android.graphics.Color.parseColor("#08090C"))
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(this, true)
+
+                settings.apply {
+                    javaScriptEnabled = true
+                    domStorageEnabled = true
+                    databaseEnabled = true
+                    allowFileAccess = true
+                    allowContentAccess = true
+                    mediaPlaybackRequiresUserGesture = false
+                    javaScriptCanOpenWindowsAutomatically = true
+                    setSupportMultipleWindows(false)
+                    mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+                    cacheMode = WebSettings.LOAD_DEFAULT
+                    userAgentString = userAgentString.replace("; wv", "")
+                }
+
+                addJavascriptInterface(
+                    NativeWebBridge(ctx, onSpeakImmediate, onStopImmediate),
+                    "AndroidNative"
+                )
+
+                webViewClient = object : WebViewClient() {
+                    override fun shouldInterceptRequest(
+                        view: WebView?,
+                        request: WebResourceRequest
+                    ): WebResourceResponse? {
+                        return assetLoader.shouldInterceptRequest(request.url)
+                    }
+
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        pageFinished = true
+                    }
+                }
+
+                webChromeClient = object : WebChromeClient() {
+                    override fun onPermissionRequest(request: PermissionRequest?) {
+                        request?.grant(request.resources)
+                    }
+
+                    override fun onShowFileChooser(
+                        webView: WebView?,
+                        callback: ValueCallback<Array<Uri>>?,
+                        fileChooserParams: FileChooserParams?
+                    ): Boolean {
+                        filePathCallback?.onReceiveValue(null)
+                        filePathCallback = callback
+                        return try {
+                            val intent = fileChooserParams?.createIntent() ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                                addCategory(Intent.CATEGORY_OPENABLE)
+                                type = "*/*"
+                            }
+                            fileChooserLauncher.launch(intent)
+                            true
+                        } catch (_: Exception) {
+                            filePathCallback = null
+                            false
+                        }
+                    }
+                }
+
+                setDownloadListener { url, userAgent, contentDisposition, mimeType, _ ->
+                    try {
+                        if (url.startsWith("http://") || url.startsWith("https://")) {
+                            val req = DownloadManager.Request(Uri.parse(url)).apply {
+                                setMimeType(mimeType)
+                                addRequestHeader("User-Agent", userAgent)
+                                setTitle(URLUtil.guessFileName(url, contentDisposition, mimeType))
+                                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                                setDestinationInExternalPublicDir(
+                                    Environment.DIRECTORY_DOWNLOADS,
+                                    URLUtil.guessFileName(url, contentDisposition, mimeType)
+                                )
+                            }
+                            val dm = ctx.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+                            dm.enqueue(req)
+                            Toast.makeText(ctx, "Mengunduh file...", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (_: Exception) {}
+                }
+
+                loadUrl("https://appassets.androidplatform.net/assets/index.html")
+                webViewInstance = this
+                onWebViewReady(this)
+            }
+        }
+    )
+}
